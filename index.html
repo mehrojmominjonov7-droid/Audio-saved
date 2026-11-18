@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kod</title>
+<style>
+:root{--bg:#faf9f6;--text:#1f1e1b;--muted:#6b6a64;--line:#e4e2db;--code-bg:#f3f1ec}
+@media (prefers-color-scheme:dark){:root{--bg:#1a1917;--text:#ece9e2;--muted:#9a978e;--line:#38362f;--code-bg:#12110f}}
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+main{max-width:900px;margin:0 auto;padding:16px}
+.f{margin:20px 0 6px;font:600 13px/1.4 ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
+.code{background:var(--code-bg);border:1px solid var(--line);border-radius:10px;overflow-x:auto}
+pre{margin:0;padding:12px 14px}
+pre code{font:12.5px/1.55 ui-monospace,Menlo,Consolas,monospace;color:var(--text);white-space:pre}
+</style>
+</head>
+<body>
+<main>
+<div class="f">main.py</div><div class="code"><pre><code>&quot;&quot;&quot;
+main.py — botni ishga tushiruvchi asosiy fayl.
+
+Ishga tushirish:  python main.py
+&quot;&quot;&quot;
+
+import asyncio
+import logging
+import sys
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+from config import BOT_TOKEN
+from downloader import cleanup_all_downloads
+from handlers import router
+
+logger = logging.getLogger(__name__)
+
+
+async def main() -&gt; None:
+    # Token mavjudligini tekshiramiz
+    if not BOT_TOKEN:
+        logger.critical(&quot;BOT_TOKEN topilmadi! .env fayliga BOT_TOKEN=... qo&#x27;shing.&quot;)
+        sys.exit(1)
+
+    # Oldingi ishdan qolgan vaqtinchalik fayllarni tozalaymiz
+    cleanup_all_downloads()
+
+    # Bot obyekti (xabarlar standart holda HTML formatida yuboriladi)
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    try:
+        me = await bot.get_me()
+        logger.info(&quot;Bot ishga tushdi: @%s&quot;, me.username)
+
+        # Bot o&#x27;chiq paytida to&#x27;planib qolgan eski xabarlarni o&#x27;tkazib yuboramiz
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+    finally:
+        # Bot to&#x27;xtaganda sessiyani yopamiz va fayllarni tozalaymiz
+        await bot.session.close()
+        cleanup_all_downloads()
+        logger.info(&quot;Bot to&#x27;xtatildi.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    logging.basicConfig(
+        level=logging.INFO,
+        format=&quot;%(asctime)s | %(levelname)s | %(name)s | %(message)s&quot;,
+    )
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info(&quot;Bot qo&#x27;lda to&#x27;xtatildi.&quot;)
+</code></pre></div>
+<div class="f">handlers.py</div><div class="code"><pre><code>&quot;&quot;&quot;
+handlers.py — Telegram xabarlari va tugmalarini qayta ishlovchi handlerlar.
+&quot;&quot;&quot;
+
+import asyncio
+import html
+import logging
+import re
+import uuid
+from collections import OrderedDict
+from typing import Optional
+
+from aiogram import Bot, F, Router
+from aiogram.enums import ChatAction
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+from config import (
+    AUDIO_BUTTON_TEXT,
+    AUDIO_DOWNLOADING_TEXT,
+    DOWNLOADING_TEXT,
+    ERROR_TEXT,
+    EXPIRED_LINK_TEXT,
+    MAX_CONCURRENT_DOWNLOADS,
+    NOT_A_LINK_TEXT,
+    START_TEXT,
+    TOO_LARGE_TEXT,
+    UNSUPPORTED_LINK_TEXT,
+)
+from downloader import (
+    FileTooLargeError,
+    cleanup_folder,
+    detect_platform,
+    download_audio,
+    download_video,
+    extract_url,
+)
+
+logger = logging.getLogger(__name__)
+
+router = Router()
+
+# Bir vaqtda ishlayotgan yuklashlar sonini cheklaymiz
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+# Callback tugmasi ma&#x27;lumoti 64 baytdan oshmasligi kerak, shuning uchun uzun
+# havolani tugmaga sig&#x27;dirib bo&#x27;lmaydi. Havolani xotirada qisqa kalit bilan saqlaymiz.
+URL_CACHE: &quot;OrderedDict[str, str]&quot; = OrderedDict()
+URL_CACHE_LIMIT = 1000  # eng ko&#x27;pi bilan nechta havola saqlanadi
+
+
+# ---------------------------------------------------------------------------
+# Yordamchi funksiyalar
+# ---------------------------------------------------------------------------
+
+
+def remember_url(url: str) -&gt; str:
+    &quot;&quot;&quot;Havolani keshga saqlab, qisqa kalit qaytaradi.&quot;&quot;&quot;
+    key = uuid.uuid4().hex[:12]
+    URL_CACHE[key] = url
+    # Kesh to&#x27;lib ketsa, eng eskilarini o&#x27;chiramiz
+    while len(URL_CACHE) &gt; URL_CACHE_LIMIT:
+        URL_CACHE.popitem(last=False)
+    return key
+
+
+def audio_keyboard(url_key: str) -&gt; InlineKeyboardMarkup:
+    &quot;&quot;&quot;Video ostidagi &quot;Musiqasini ajratib olish&quot; tugmasi.&quot;&quot;&quot;
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=AUDIO_BUTTON_TEXT,
+                    callback_data=f&quot;audio:{url_key}&quot;,
+                )
+            ]
+        ]
+    )
+
+
+async def safe_delete(message: Optional[Message]) -&gt; None:
+    &quot;&quot;&quot;Xabarni o&#x27;chirishga urinadi; xatolik bo&#x27;lsa e&#x27;tiborsiz qoldiradi.&quot;&quot;&quot;
+    if not message:
+        return
+    try:
+        await message.delete()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(&quot;Xabarni o&#x27;chirib bo&#x27;lmadi: %s&quot;, exc)
+
+
+def safe_filename(name: str, default: str = &quot;audio&quot;) -&gt; str:
+    &quot;&quot;&quot;Fayl nomidan taqiqlangan belgilarni olib tashlaydi.&quot;&quot;&quot;
+    cleaned = re.sub(r&#x27;[\\/:*?&quot;&lt;&gt;|\r\n]+&#x27;, &quot; &quot;, name).strip()
+    return cleaned[:60] or default
+
+
+# ---------------------------------------------------------------------------
+# /start buyrug&#x27;i
+# ---------------------------------------------------------------------------
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message) -&gt; None:
+    &quot;&quot;&quot;Xush kelibsiz xabarini yuboradi.&quot;&quot;&quot;
+    try:
+        await message.answer(START_TEXT)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(&quot;/start xatosi: %s&quot;, exc)
+
+
+# ---------------------------------------------------------------------------
+# Havola kelganda — videoni yuklab yuborish
+# ---------------------------------------------------------------------------
+
+
+@router.message(F.text)
+async def handle_link(message: Message, bot: Bot) -&gt; None:
+    &quot;&quot;&quot;Foydalanuvchi yuborgan havolani qabul qilib, videoni yuklab beradi.&quot;&quot;&quot;
+    url = extract_url(message.text or &quot;&quot;)
+
+    # 1) Xabarda havola bormi?
+    if not url:
+        await message.answer(NOT_A_LINK_TEXT)
+        return
+
+    # 2) Havola qo&#x27;llab-quvvatlanadigan tarmoqqa tegishlimi?
+    platform = detect_platform(url)
+    if not platform:
+        await message.answer(UNSUPPORTED_LINK_TEXT)
+        return
+
+    logger.info(&quot;Yangi so&#x27;rov: user=%s platform=%s&quot;, message.from_user.id if message.from_user else &quot;?&quot;, platform)
+
+    # 3) Holat xabari
+    status_msg: Optional[Message] = None
+    result = None
+
+    try:
+        status_msg = await message.answer(DOWNLOADING_TEXT)
+        await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
+
+        # 4) Yuklab olish (bir vaqtda cheklangan miqdorda)
+        async with DOWNLOAD_SEMAPHORE:
+            result = await download_video(url)
+
+        # 5) Videoni yuborish
+        await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
+        url_key = remember_url(url)
+        caption = f&quot;🎬 &lt;b&gt;{html.escape(result.title[:200])}&lt;/b&gt;\n\n📥 Platforma: {platform}&quot;
+
+        await message.answer_video(
+            video=FSInputFile(result.file_path),
+            caption=caption,
+            duration=result.duration,
+            width=result.width,
+            height=result.height,
+            supports_streaming=True,
+            reply_markup=audio_keyboard(url_key),
+        )
+
+        # 6) Holat xabarini o&#x27;chiramiz
+        await safe_delete(status_msg)
+
+    except FileTooLargeError:
+        await safe_delete(status_msg)
+        await message.answer(TOO_LARGE_TEXT)
+
+    except Exception as exc:  # noqa: BLE001
+        # Yaroqsiz havola, o&#x27;chirilgan video, tarmoq xatosi va h.k.
+        logger.warning(&quot;Video yuklashda xatolik (%s): %s&quot;, url, exc)
+        await safe_delete(status_msg)
+        try:
+            await message.answer(ERROR_TEXT)
+        except Exception as send_exc:  # noqa: BLE001
+            logger.error(&quot;Xato xabarini yuborib bo&#x27;lmadi: %s&quot;, send_exc)
+
+    finally:
+        # 7) Vaqtinchalik fayllarni har doim o&#x27;chiramiz (cleanup)
+        if result:
+            cleanup_folder(result.folder)
+
+
+# ---------------------------------------------------------------------------
+# &quot;Musiqasini ajratib olish&quot; tugmasi
+# ---------------------------------------------------------------------------
+
+
+@router.callback_query(F.data.startswith(&quot;audio:&quot;))
+async def handle_audio(callback: CallbackQuery, bot: Bot) -&gt; None:
+    &quot;&quot;&quot;Videoning musiqasini MP3 ko&#x27;rinishida ajratib yuboradi.&quot;&quot;&quot;
+    message = callback.message
+    if not isinstance(message, Message):
+        await callback.answer()
+        return
+
+    url_key = (callback.data or &quot;&quot;).split(&quot;:&quot;, 1)[1]
+    url = URL_CACHE.get(url_key)
+
+    if not url:
+        await callback.answer(EXPIRED_LINK_TEXT, show_alert=True)
+        return
+
+    # Tugma &quot;aylanib&quot; qolmasligi uchun darhol javob beramiz
+    await callback.answer(&quot;🎵 Musiqa ajratilmoqda...&quot;)
+
+    status_msg: Optional[Message] = None
+    result = None
+
+    try:
+        status_msg = await message.answer(AUDIO_DOWNLOADING_TEXT)
+        await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VOICE)
+
+        async with DOWNLOAD_SEMAPHORE:
+            result = await download_audio(url)
+
+        await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VOICE)
+        await message.answer_audio(
+            audio=FSInputFile(
+                result.file_path,
+                filename=f&quot;{safe_filename(result.title)}.mp3&quot;,
+            ),
+            title=result.title[:64],
+            performer=(result.uploader or &quot;&quot;)[:64] or None,
+            duration=result.duration,
+            caption=&quot;🎧 Musiqa ajratib olindi&quot;,
+        )
+
+        await safe_delete(status_msg)
+
+    except FileTooLargeError:
+        await safe_delete(status_msg)
+        await message.answer(TOO_LARGE_TEXT)
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(&quot;Audio ajratishda xatolik (%s): %s&quot;, url, exc)
+        await safe_delete(status_msg)
+        try:
+            await message.answer(ERROR_TEXT)
+        except Exception as send_exc:  # noqa: BLE001
+            logger.error(&quot;Xato xabarini yuborib bo&#x27;lmadi: %s&quot;, send_exc)
+
+    finally:
+        if result:
+            cleanup_folder(result.folder)
+</code></pre></div>
+<div class="f">downloader.py</div><div class="code"><pre><code>&quot;&quot;&quot;
+downloader.py — havolani aniqlash va yt-dlp orqali video/audio yuklab olish.
+
+Barcha og&#x27;ir (bloklovchi) ishlar alohida oqimda (thread) bajariladi,
+shuning uchun bot boshqa foydalanuvchilarga javob berishda davom etadi.
+&quot;&quot;&quot;
+
+import asyncio
+import logging
+import re
+import shutil
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
+
+import yt_dlp
+from yt_dlp.utils import match_filter_func
+
+from config import (
+    COOKIES_FILE,
+    DOWNLOAD_DIR,
+    MAX_DURATION_SECONDS,
+    MAX_FILE_SIZE_MB,
+)
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Xatolik turlari
+# ---------------------------------------------------------------------------
+
+
+class DownloaderError(Exception):
+    &quot;&quot;&quot;Yuklab olishdagi umumiy xatolik.&quot;&quot;&quot;
+
+
+class FileTooLargeError(DownloaderError):
+    &quot;&quot;&quot;Fayl Telegram uchun juda katta.&quot;&quot;&quot;
+
+
+# ---------------------------------------------------------------------------
+# Havolani aniqlash
+# ---------------------------------------------------------------------------
+
+# Matn ichidan havolani topish uchun regex
+URL_REGEX = re.compile(r&quot;https?://[^\s&lt;&gt;\&quot;&#x27;]+&quot;, re.IGNORECASE)
+
+# Platforma nomi -&gt; domen (host) regexi
+PLATFORM_HOSTS: dict[str, re.Pattern] = {
+    &quot;Instagram&quot;: re.compile(r&quot;(^|\.)(instagram\.com|instagr\.am)$&quot;),
+    &quot;YouTube&quot;: re.compile(r&quot;(^|\.)(youtube\.com|youtu\.be|youtube-nocookie\.com)$&quot;),
+    &quot;TikTok&quot;: re.compile(r&quot;(^|\.)tiktok\.com$&quot;),
+    # Pinterest turli mamlakat domenlarida bo&#x27;ladi (pinterest.com, pinterest.co.uk ...)
+    &quot;Pinterest&quot;: re.compile(r&quot;(^|\.)(pinterest\.[a-z.]{2,}|pin\.it)$&quot;),
+}
+
+
+def extract_url(text: str) -&gt; Optional[str]:
+    &quot;&quot;&quot;Matn ichidan birinchi havolani ajratib oladi.&quot;&quot;&quot;
+    match = URL_REGEX.search(text or &quot;&quot;)
+    if not match:
+        return None
+    # Havola oxiridagi ortiqcha belgilarni (nuqta, vergul, qavs) olib tashlaymiz
+    return match.group(0).rstrip(&quot;.,;:!?)]}&quot;)
+
+
+def detect_platform(url: str) -&gt; Optional[str]:
+    &quot;&quot;&quot;Havola qaysi platformaga tegishli ekanini aniqlaydi.&quot;&quot;&quot;
+    try:
+        host = (urlparse(url).hostname or &quot;&quot;).lower()
+    except ValueError:
+        return None
+
+    for platform, pattern in PLATFORM_HOSTS.items():
+        if pattern.search(host):
+            return platform
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Natija strukturasi
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DownloadResult:
+    &quot;&quot;&quot;Yuklab olingan faylning ma&#x27;lumotlari.&quot;&quot;&quot;
+
+    folder: Path  # shu yuklash uchun yaratilgan alohida papka
+    file_path: Path  # yuklangan fayl yo&#x27;li
+    title: str
+    uploader: Optional[str]
+    duration: Optional[int]
+    width: Optional[int]
+    height: Optional[int]
+
+
+# ---------------------------------------------------------------------------
+# Yordamchi funksiyalar
+# ---------------------------------------------------------------------------
+
+
+def cleanup_folder(folder: Optional[Path]) -&gt; None:
+    &quot;&quot;&quot;Vaqtinchalik papkani butunlay o&#x27;chiradi (xatolik bo&#x27;lsa ham jim turadi).&quot;&quot;&quot;
+    if not folder:
+        return
+    try:
+        shutil.rmtree(folder, ignore_errors=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(&quot;Papkani o&#x27;chirib bo&#x27;lmadi %s: %s&quot;, folder, exc)
+
+
+def cleanup_all_downloads() -&gt; None:
+    &quot;&quot;&quot;Bot ishga tushganda downloads/ papkasidagi eski qoldiqlarni tozalaydi.&quot;&quot;&quot;
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    for item in DOWNLOAD_DIR.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(&quot;Eski faylni o&#x27;chirib bo&#x27;lmadi %s: %s&quot;, item, exc)
+
+
+def _find_media_file(folder: Path) -&gt; Optional[Path]:
+    &quot;&quot;&quot;Papkadagi eng katta tayyor media faylni topadi (.part va h.k. larni o&#x27;tkazib yuboradi).&quot;&quot;&quot;
+    ignored_suffixes = {&quot;.part&quot;, &quot;.ytdl&quot;, &quot;.temp&quot;, &quot;.json&quot;, &quot;.jpg&quot;, &quot;.jpeg&quot;, &quot;.png&quot;, &quot;.webp&quot;, &quot;.vtt&quot;, &quot;.srt&quot;}
+    candidates = [
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() not in ignored_suffixes
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_size)
+
+
+def _common_options(folder: Path) -&gt; dict:
+    &quot;&quot;&quot;Video va audio uchun umumiy yt-dlp sozlamalari.&quot;&quot;&quot;
+    opts: dict = {
+        &quot;outtmpl&quot;: str(folder / &quot;media.%(ext)s&quot;),
+        &quot;noplaylist&quot;: True,  # faqat bitta videoni yuklaymiz
+        &quot;quiet&quot;: True,
+        &quot;no_warnings&quot;: True,
+        &quot;retries&quot;: 3,
+        &quot;socket_timeout&quot;: 30,
+        &quot;restrictfilenames&quot;: True,
+        # Juda uzun videolarni o&#x27;tkazib yuboramiz (&quot;&lt;=?&quot; — davomiylik noma&#x27;lum bo&#x27;lsa ham o&#x27;tkazadi)
+        &quot;match_filter&quot;: match_filter_func(f&quot;duration &lt;=? {MAX_DURATION_SECONDS}&quot;),
+    }
+    if COOKIES_FILE:
+        opts[&quot;cookiefile&quot;] = COOKIES_FILE
+    return opts
+
+
+def _video_options(folder: Path) -&gt; dict:
+    &quot;&quot;&quot;Video yuklash sozlamalari: Telegram&#x27;ga mos H.264/MP4, hajm chegarasi ichida eng sifatli.&quot;&quot;&quot;
+    size = f&quot;{MAX_FILE_SIZE_MB}M&quot;
+    opts = _common_options(folder)
+    opts.update(
+        {
+            # Format tanlash (chapdan o&#x27;ngga, birinchi mos kelgani olinadi):
+            # 1) H.264 video + M4A audio (hajm chegarasi ichida)
+            # 2) tayyor MP4 (hajm chegarasi ichida)
+            # 3) istalgan format (hajm chegarasi ichida)
+            # 4) oxirgi chora — eng yaxshi mavjud format
+            # TikTok&#x27;da yt-dlp standart holda suv belgisiz formatni tanlaydi.
+            &quot;format&quot;: (
+                f&quot;bv*[vcodec^=avc1][filesize&lt;?{size}][filesize_approx&lt;?{size}]+ba[ext=m4a]&quot;
+                f&quot;/b[ext=mp4][filesize&lt;?{size}][filesize_approx&lt;?{size}]&quot;
+                f&quot;/b[filesize&lt;?{size}][filesize_approx&lt;?{size}]&quot;
+                &quot;/b&quot;
+            ),
+            &quot;merge_output_format&quot;: &quot;mp4&quot;,  # ffmpeg kerak
+        }
+    )
+    return opts
+
+
+def _audio_options(folder: Path) -&gt; dict:
+    &quot;&quot;&quot;Audio yuklash sozlamalari: eng yaxshi audio -&gt; MP3 (ffmpeg kerak).&quot;&quot;&quot;
+    opts = _common_options(folder)
+    opts.update(
+        {
+            &quot;format&quot;: &quot;bestaudio/best&quot;,
+            &quot;postprocessors&quot;: [
+                {
+                    &quot;key&quot;: &quot;FFmpegExtractAudio&quot;,
+                    &quot;preferredcodec&quot;: &quot;mp3&quot;,
+                    &quot;preferredquality&quot;: &quot;192&quot;,
+                }
+            ],
+        }
+    )
+    return opts
+
+
+# ---------------------------------------------------------------------------
+# Asosiy yuklash mantig&#x27;i (sinxron)
+# ---------------------------------------------------------------------------
+
+
+def _download_sync(url: str, audio_only: bool) -&gt; DownloadResult:
+    &quot;&quot;&quot;yt-dlp yordamida faylni yuklab oladi. Alohida oqimda chaqiriladi.&quot;&quot;&quot;
+    # Har bir yuklash uchun noyob papka — fayllar aralashib ketmaydi
+    folder = DOWNLOAD_DIR / uuid.uuid4().hex
+    folder.mkdir(parents=True, exist_ok=True)
+
+    try:
+        options = _audio_options(folder) if audio_only else _video_options(folder)
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        if not info:
+            raise DownloaderError(&quot;Havoladan ma&#x27;lumot olinmadi.&quot;)
+
+        # Agar natija bir nechta elementdan iborat bo&#x27;lsa (masalan, Instagram karusel),
+        # birinchisini olamiz
+        if &quot;entries&quot; in info:
+            entries = [e for e in (info.get(&quot;entries&quot;) or []) if e]
+            if not entries:
+                raise DownloaderError(&quot;Havolada video topilmadi.&quot;)
+            info = entries[0]
+
+        file_path = _find_media_file(folder)
+        if not file_path:
+            # Fayl yuklanmagan: davomiylik yoki hajm chegarasidan oshgan bo&#x27;lishi mumkin
+            raise DownloaderError(&quot;Fayl yuklanmadi (chegaradan oshgan yoki mavjud emas).&quot;)
+
+        # Telegram chegarasini tekshiramiz
+        size_mb = file_path.stat().st_size / (1024 * 1024)
+        if size_mb &gt; MAX_FILE_SIZE_MB:
+            raise FileTooLargeError(f&quot;Fayl hajmi {size_mb:.1f} MB.&quot;)
+
+        duration = info.get(&quot;duration&quot;)
+        return DownloadResult(
+            folder=folder,
+            file_path=file_path,
+            title=(info.get(&quot;title&quot;) or &quot;Media&quot;).strip(),
+            uploader=info.get(&quot;uploader&quot;) or info.get(&quot;channel&quot;),
+            duration=int(duration) if duration else None,
+            width=info.get(&quot;width&quot;),
+            height=info.get(&quot;height&quot;),
+        )
+
+    except Exception:
+        # Xatolik bo&#x27;lsa — papkani darhol tozalab, xatoni yuqoriga uzatamiz
+        cleanup_folder(folder)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Asinxron interfeys (handlers.py shularni chaqiradi)
+# ---------------------------------------------------------------------------
+
+
+async def download_video(url: str) -&gt; DownloadResult:
+    &quot;&quot;&quot;Videoni yuklab oladi (event loop&#x27;ni bloklamaydi).&quot;&quot;&quot;
+    return await asyncio.to_thread(_download_sync, url, False)
+
+
+async def download_audio(url: str) -&gt; DownloadResult:
+    &quot;&quot;&quot;Videodan musiqani MP3 ko&#x27;rinishida ajratib oladi.&quot;&quot;&quot;
+    return await asyncio.to_thread(_download_sync, url, True)
+</code></pre></div>
+<div class="f">config.py</div><div class="code"><pre><code>&quot;&quot;&quot;
+config.py — loyihaning barcha sozlamalari shu yerda saqlanadi.
+
+.env faylidan BOT_TOKEN va boshqa ixtiyoriy sozlamalar o&#x27;qiladi.
+&quot;&quot;&quot;
+
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# .env faylini o&#x27;qib, qiymatlarni muhit o&#x27;zgaruvchilariga yuklaymiz
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Asosiy sozlamalar
+# ---------------------------------------------------------------------------
+
+# Telegram bot tokeni (@BotFather dan olinadi)
+BOT_TOKEN: str = os.getenv(&quot;BOT_TOKEN&quot;, &quot;&quot;).strip()
+
+# Loyiha papkasi va vaqtinchalik yuklamalar papkasi
+BASE_DIR: Path = Path(__file__).resolve().parent
+DOWNLOAD_DIR: Path = BASE_DIR / &quot;downloads&quot;
+
+# Telegram Bot API orqali yuborish mumkin bo&#x27;lgan maksimal fayl hajmi (MB).
+# Oddiy Bot API uchun chegara 50 MB. Agar o&#x27;zingizning Local Bot API
+# serveringiz bo&#x27;lsa, bu qiymatni oshirishingiz mumkin (masalan, 2000).
+MAX_FILE_SIZE_MB: int = int(os.getenv(&quot;MAX_FILE_SIZE_MB&quot;, &quot;50&quot;))
+
+# Juda uzun videolarni yuklab olmaslik uchun maksimal davomiylik (soniyada).
+# Standart: 30 daqiqa.
+MAX_DURATION_SECONDS: int = int(os.getenv(&quot;MAX_DURATION_SECONDS&quot;, &quot;1800&quot;))
+
+# Bir vaqtning o&#x27;zida nechta yuklab olish jarayoni ishlashi mumkin
+# (server resurslarini himoya qilish uchun).
+MAX_CONCURRENT_DOWNLOADS: int = int(os.getenv(&quot;MAX_CONCURRENT_DOWNLOADS&quot;, &quot;3&quot;))
+
+# Ixtiyoriy: Instagram kabi tarmoqlar ba&#x27;zan cookies talab qiladi.
+# Netscape formatidagi cookies.txt fayl yo&#x27;lini .env da ko&#x27;rsating.
+COOKIES_FILE: str | None = os.getenv(&quot;COOKIES_FILE&quot;, &quot;&quot;).strip() or None
+
+# ---------------------------------------------------------------------------
+# Foydalanuvchiga ko&#x27;rsatiladigan matnlar
+# ---------------------------------------------------------------------------
+
+START_TEXT: str = (
+    &quot;👋 &lt;b&gt;Xush kelibsiz!&lt;/b&gt;\n\n&quot;
+    &quot;Men ijtimoiy tarmoqlardan video va musiqalarni &quot;
+    &quot;&lt;b&gt;suv belgisiz (watermark&#x27;siz)&lt;/b&gt; yuklab beraman.\n\n&quot;
+    &quot;📌 &lt;b&gt;Qo&#x27;llab-quvvatlanadigan tarmoqlar:&lt;/b&gt;\n&quot;
+    &quot;• 📸 Instagram — Reels, Post\n&quot;
+    &quot;• ▶️ YouTube — Shorts, Video\n&quot;
+    &quot;• 🎵 TikTok\n&quot;
+    &quot;• 📍 Pinterest\n\n&quot;
+    &quot;🔗 Shunchaki video havolasini (linkini) menga yuboring — &quot;
+    &quot;qolganini o&#x27;zim bajaraman.\n&quot;
+    &quot;🎧 Video ostidagi tugma orqali uning musiqasini ham ajratib olishingiz mumkin.&quot;
+)
+
+DOWNLOADING_TEXT: str = &quot;⏳ Video yuklab olinmoqda, iltimos kuting...&quot;
+AUDIO_DOWNLOADING_TEXT: str = &quot;⏳ Musiqa ajratib olinmoqda, iltimos kuting...&quot;
+
+ERROR_TEXT: str = (
+    &quot;Kechirasiz, bu havoladan video yuklab bo&#x27;lmadi. &quot;
+    &quot;Havolani tekshirib qaytadan urinib ko&#x27;ring.&quot;
+)
+
+TOO_LARGE_TEXT: str = (
+    &quot;Kechirasiz, bu fayl hajmi juda katta, uni Telegram orqali yuborib bo&#x27;lmaydi &quot;
+    f&quot;(maksimal {MAX_FILE_SIZE_MB} MB).&quot;
+)
+
+NOT_A_LINK_TEXT: str = (
+    &quot;🔗 Iltimos, video havolasini (linkini) yuboring.\n&quot;
+    &quot;Masalan: Instagram, YouTube, TikTok yoki Pinterest havolasi.&quot;
+)
+
+UNSUPPORTED_LINK_TEXT: str = (
+    &quot;⚠️ Bu havola qo&#x27;llab-quvvatlanmaydi.\n&quot;
+    &quot;Faqat Instagram, YouTube, TikTok va Pinterest havolalarini yuboring.&quot;
+)
+
+EXPIRED_LINK_TEXT: str = &quot;Havola eskirgan. Iltimos, videoni qaytadan yuboring.&quot;
+
+AUDIO_BUTTON_TEXT: str = &quot;🎵 Musiqasini ajratib olish&quot;
+</code></pre></div>
+<div class="f">requirements.txt</div><div class="code"><pre><code>aiogram&gt;=3.13,&lt;4.0
+yt-dlp
+python-dotenv&gt;=1.0
+</code></pre></div>
+<div class="f">.env.example</div><div class="code"><pre><code># Bu faylni &quot;.env&quot; nomiga o&#x27;zgartiring va tokeningizni yozing
+BOT_TOKEN=123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- Ixtiyoriy sozlamalar ---
+# MAX_FILE_SIZE_MB=50
+# MAX_DURATION_SECONDS=1800
+# MAX_CONCURRENT_DOWNLOADS=3
+# Instagram uchun cookies fayli (Netscape formati):
+# COOKIES_FILE=cookies.txt
+</code></pre></div>
+</main>
+</body>
+</html>
